@@ -1,0 +1,441 @@
+Principles of parallelization, with implementation in R
+==============================================================
+
+Chris Paciorek, Department of Statistics, UC Berkeley
+
+```{r setup, include=FALSE}
+library(knitr)
+library(stringr)
+read_chunk('parallel.R')
+```
+
+# 0) This talk
+
+This talk covers basic principles for parallelization and  basic strategies for using parallel processing in R on single machines and multiple nodes/computers.
+
+I'll demonstrate this on a standalone Linux machine and/or on the campus computing cluster, Savio.
+At least for the single-machine parallelization, you should be able to replicate this on your own laptop.
+
+This talk assumes you have a working knowledge of R. 
+
+Materials for this session, including the R markdown file and associated code files that were used to create this document are available on Github at [https://github.com/berkeley-scf/parallel-bbd-2018](https://github.com/berkeley-scf/parallel-bbd-2018).
+
+The materials are an R-focused subset of the material in two tutorials I've prepared, [one for parallel computing on one computer or node (shared memory)](https://github.com/berkeley-scf/tutorial-parallel-basics) and [one for parallel computing on multiple nodes (distributed memory)](https://github.com/berkeley-scf/tutorial-parallel-distributed).
+
+To create this HTML document, simply compile the corresponding R Markdown file in R as follows (the following will work from within BCE after cloning the repository as above).
+```{r, build-html, eval=FALSE}
+Rscript -e "library(knitr); knit2html('parallel.Rmd')"
+```
+
+# 1) Some scenarios for parallelization
+
+  - You need to fit a single statistical/machine learning model, such as a random forest or regression model, to your data.
+  - You need to fit three different statistical/machine learning models to your data.
+  - You are running an ensemble prediction method such as SuperLearner on 10 cross-validation folds, with five statistical/machine learning methods.
+  - You are running an ensemble prediction method such as SuperLearner on 10 cross-validation folds, with 30 statistical/machine learning methods.
+  - You are running a simulation study with n=1000 replicates. Each replicate involves fitting 20 statistical/machine learning methods.
+  - You are using bootstrapping on a very large dataset to compute a confidence interval or standard error.
+
+Given you are in such a situation, can you do things in parallel? Can you do it on your laptop or a single computer? Will it be useful (e.g., faster or provide access to sufficient memory) to use multiple computers, such as multiple nodes in a Linux cluster?
+
+# 2) Types of parallel processing
+
+There are two basic flavors of parallel processing (leaving aside
+GPUs): distributed memory and shared memory. With shared memory, multiple
+processors (which I'll call cores) share the same memory. With distributed
+memory, you have multiple nodes, each with their own memory. You can
+think of each node as a separate computer connected by a fast network. 
+
+## 2.1) Some useful terminology:
+
+  - *cores*: We'll use this term to mean the different processing
+units available on a single node.
+  - *nodes*: We'll use this term to mean the different computers,
+each with their own distinct memory, that make up a cluster or supercomputer.
+  - *processes*: instances of programs executing on a machine; multiple
+processes may be executing at once. A given running program may start up multiple
+processes at once. Ideally we have no more processes than cores on
+a node.
+  - *tasks*: individual units of computation; one or more tasks might
+be executed by a given process on a given core
+  - *threads*: multiple paths of execution within a single process;
+the OS sees the threads as a single process, but one can think of
+them as 'lightweight' processes. Ideally when considering the processes
+and their threads, we would have no more processes and threads combined
+than cores on a node.
+  - *forking*: child processes are spawned that are identical to
+the parent, but with different process IDs and their own memory.
+  - *sockets*: some of R's parallel functionality involves creating
+new R processes (e.g., starting processes via *Rscript*) and
+communicating with them via a communication technology called sockets.
+  - *scheduler*: a program that manages users' jobs on a cluster.
+  - *load-balanced*: when all the cores that are part of a computation are busy for the entire period of time the computation is running.
+
+## 2.2) Shared memory
+
+For shared memory parallelism, each core is accessing the same memory
+so there is no need to pass information (in the form of messages)
+between different machines. But in some programming contexts one needs
+to be careful that activity on different cores doesn't mistakenly
+overwrite places in memory that are used by other cores.
+
+We'll cover two types of  shared memory parallelism approaches:
+  - threaded computations (specifically threaded linear algebra)
+  - multicore / multiprocess functionality 
+
+### Threading
+
+Threads are multiple paths of execution within a single process. If you are monitoring CPU
+usage (such as with *top* in BCE) and watching a job that is executing threaded code, you'll
+see the process using more than 100% of CPU. When this occurs, the
+process is using multiple cores, although it appears as a single process
+rather than as multiple processes.
+
+### Multicore / multiprocess computation
+
+In this case, the computation is done in multiple processes, generally one per CPU core.
+If you are monitoring CPU usage, you should see multiple processes, each at 100% of CPU.
+
+## 2.3) Distributed memory
+
+Parallel programming for distributed memory parallelism requires passing
+messages between the different nodes. The standard protocol for doing
+this is MPI, of which there are various versions, including *openMPI*.
+
+However, particularly in cases where the parallelization is simple, such as running many independent tasks, one can also use code in R that sends the information between nodes without using MPI.
+
+
+## 2.4) Other type of parallel processing
+
+We won't cover either of these in this material.
+
+### GPUs
+
+GPUs (Graphics Processing Units) are processing units originally designed
+for rendering graphics on a computer quickly. This is done by having
+a large number of simple processing units for massively parallel calculation.
+The idea of general purpose GPU (GPGPU) computing is to exploit this
+capability for general computation. A variety of machine learning methods can
+be done effectively on GPUs, and software such as Tensorflow, Torch, and Caffe
+are all built to use GPUs when available.
+
+### Spark and Hadoop
+
+Spark and Hadoop are systems for implementing computations in a distributed
+memory environment, using the MapReduce approach. We'll see this in a few weeks.
+
+
+# 3) Parallelization strategies
+
+The following are some basic principles/suggestions for how to parallelize
+your computation.
+
+All of the functionality discussed here applies *only* if the iterations/loops of your calculations can be done completely separately and do not depend on one another. This scenario is called an *embarrassingly parallel* computation.  So coding up the evolution of a time series or a Markov chain is not possible using these tools. However, bootstrapping, random forests, simulation studies, cross-validation, ensemble methods, and many other statistical methods can be handled in this way.
+
+## Should I use one machine/node or many machines/nodes?
+
+ - If you can do your computation on the cores of a single node using
+shared memory, that will generally be faster than using the same number of cores
+(or even somewhat more cores) across multiple nodes. Similarly, jobs
+with a lot of data/high memory requirements that one might think of
+as requiring Spark or Hadoop may in some cases be much faster if you can find
+a single machine with a lot of memory.
+ - That said, if you would run out of memory on a single node, then you'll
+need to use distributed memory.
+
+## What level or dimension should I parallelize over?
+
+ - If you have nested loops, you generally only want to parallelize at
+one level of the code. That said, there may be cases in which it is
+helpful to do both. Keep in mind whether your linear algebra or calls to packages are
+threaded. Often you will want to simply parallelize over a loop and not use
+threaded linear algebra or the parallel features of a given package.
+ - Often it makes sense to parallelize the outer loop when you have nested
+loops.
+ - You generally want to parallelize in such a way that your code is
+load-balanced and does not involve too much communication. 
+
+## How do I balance communication overhead with keeping my cores busy?
+
+ - If you have very few tasks, particularly if the tasks take different
+amounts of time, often some processors will be idle and your code
+poorly load-balanced.
+ - If you have very many tasks and each one takes little time, the communication
+overhead of starting and stopping the tasks will reduce efficiency.
+
+## Should multiple tasks be pre-assigned to a process (i.e., a worker) (sometimes called *prescheduling*) or should tasks
+be assigned dynamically as previous tasks finish? 
+
+ - Basically if you have many tasks that each take similar time, you
+want to preschedule the tasks to reduce communication. If you have tasks with highly variable completion times (particularly if there aren't all that many of them), you don't want to
+preschedule, to improve load-balancing.
+ - For R in particular, some of R's parallel functions allow you to say whether the 
+tasks should be prescheduled. E.g., the 
+the *mc.preschedule* argument in *mclapply*.
+
+
+
+# 4) Illustrating the principles in our specific case studies
+
+## 4.1) Scenario 1: one model fit
+
+**Scenario**: You need to fit a single statistical/machine learning model, such as a random forest or regression model, to your data.
+
+### Scenario 1A:
+
+A given method may have been written to use parallelization and you simply need to figure out how to invoke the method for it to use multiple cores.
+
+For example the documentation for the *randomForest* package doesn't indicate it can use multiple cores, but the *ranger* package can.
+
+```{r, threaded-functions}
+args(ranger::ranger)
+```
+
+### Scenario 1B:
+
+If a method does linear algebra computations on large matrices/vectors,
+R can call out to parallelized linear algebra packages (the BLAS and LAPACK).
+
+The BLAS is the library of basic linear algebra operations (written in
+Fortran or C). A fast BLAS can greatly speed up linear algebra in R
+relative to the default BLAS that comes with R. Some fast BLAS libraries
+are 
+ - Intel's *MKL*; may be available for educational use for free
+ - *OpenBLAS*; open source and free
+ - *vecLib* for Macs; provided with your Mac
+
+In addition to being fast when used on a single core, all of these BLAS libraries are
+threaded - if your computer has multiple cores and there are free
+resources, your linear algebra will use multiple cores, provided your
+program is linked against the threaded BLAS installed on your machine and provided
+the environment variable OMP_NUM_THREADS is not set to one. (Macs make use of
+VECLIB_MAXIMUM_THREADS rather than OMP_NUM_THREADS.)
+
+Threading in R is limited to linear algebra, provided R is linked against a threaded BLAS.
+
+Here's some code that illustrates
+the speed of using a threaded BLAS:
+
+```{r, R-linalg, eval=FALSE}
+```
+
+Here the elapsed time indicates that using four threads gave us a two-three times (2-3x) speedup in terms of real time, while the user time indicates that the threaded calculation took a bit more total processing time (combining time across all processors) because of the overhead of using multiple threads. 
+
+Note that the code also illustrates use of an R package that can control the number of threads from within R, but you could also have set OMP_NUM_THREADS before starting R.
+
+To use an optimized BLAS with R, talk to your systems administrator, see [Section A.3 of the R Installation and Administration Manual](https://cran.r-project.org/manuals.html), or see [these instructions to use *vecLib* BLAS from Apple's Accelerate framework on your own Mac](http://statistics.berkeley.edu/computing/blas).
+
+It's also possible to use an optimized BLAS with Python's numpy and scipy packages, on either Linux or using the Mac's *vecLib* BLAS. Details will depend on how you install Python, numpy, and scipy. 
+
+## 4.2) Scenario 2: three different prediction methods on your data
+
+**Scenario**: You need to fit three different statistical/machine learning models to your data.
+
+What are some options?
+
+  - use one core per model
+  - if you have rather more than three cores, apply the ideas here combined with Scenario 1
+  - with access to a cluster and parallelized implementations of each model, you might use one node per model
+
+```{r, mcparallel}
+```
+
+Why might this not have shown a perfect three-fold speedup?
+
+You could also have used tools like *foreach* and *parLapply* here as well. More on these later.
+
+
+## 4.3) Scenario 3: 10-fold CV and 10 or fewer cores
+
+**Scenario**: You are running an ensemble prediction method such as SuperLearner on 10 cross-validation folds, with five statistical/machine learning methods.
+
+What are some options if you only have access to a few cores?
+
+  - (case A) parallelize over the folds (preferred - why?)
+  - (case B) parallelize over the methods 
+
+Here I'll illustrate parallel looping, using leave-one-out cross-validation rather than 10-fold CV.
+
+```{r, foreach}
+```
+
+Note that *foreach*
+also provides functionality for collecting and managing
+the results to avoid some of the bookkeeping
+you would need to do if writing your own standard for loop.
+The result of *foreach* will generally be a list, unless 
+we request the results be combined in different way, as we do here using `.combine = c`.
+
+You can debug by running serially using *%do%* rather than
+*%dopar%*. Note that you may need to load packages within the
+*foreach* construct to ensure a package is available to all of
+the calculations.
+
+### Alternatively using parallel apply statements
+
+The *parallel* package has the ability to parallelize the various
+*apply* functions (*apply*, *lapply*, *sapply*, etc.). It's a bit hard to find the [vignette for the parallel package](http://stat.ethz.ch/R-manual/R-devel/library/parallel/doc/parallel.pdf)
+because parallel is not listed as one of
+the contributed packages on CRAN (it gets installed with R by default).
+
+We'll consider parallel *lapply* and *sapply*. These rely on having started a cluster using *cluster*, which starts new jobs via *Rscript* 
+and communicates via a technology called sockets.
+
+```{r, parallel-lsApply}
+```
+
+Here the miniscule user time is probably because the time spent in the worker processes is not counted at the level of the overall master process that dispatches the workers.
+
+For help with these functions and additional related parallelization functions (including *parApply*), see `help(clusterApply)`.
+
+Now suppose you have 4 cores (and therefore won't have an equal number of tasks per core). The approach in the next scenario should work better. 
+
+## 4.4) Scenario 4: parallelizing over prediction methods
+
+**Scenario**: parallelizing over prediction methods or other cases where execution time varies
+
+If you need to parallelize over prediction methods or in other contexts in which the computation time for the different tasks varies widely, you want to avoid having the parallelization tool group the tasks in advance, because some cores may finish a lot more quickly than others. In many cases, this sort of prescheduling or 'static' allocation of tasks to workers is the default.
+
+```{r, parallel-mclapply-no-preschedule}
+```
+
+
+## 4.5) Scenario 5: 10-fold CV with many more than 10 cores
+
+**Scenario**: You are running an ensemble prediction method such as SuperLearner on 10 cross-validation folds, with five statistical/machine learning methods.
+
+Here you want to take advantage of all the cores you have available, so you can't just parallelize over folds. There are a couple ways we can deal with such *nested parallelization*.
+
+### Scenario 5A: nested parallelization
+
+One can always flatten the looping, either in a for loop or in similar ways when using apply-style statements.
+
+```{r, eval=FALSE}
+## original code: multiple loops
+for(fold in 1:n) {
+      for(method in 1:M) {
+        ### code here
+      }}
+
+## revised code: flatten the loops
+output <- foreach(idx = 1:(n*M)) %dopar% {
+   fold <- idx %/% M + 1
+   method <- idx %% M + 1
+   ### code here
+   }
+```
+
+Alternatively, *foreach* supports nested parallelization as follows:
+
+```{r, eval=FALSE}
+output <- foreach(fold = 1:n) %:%
+    foreach(method = 1:M) %dopar% {
+    ## code here
+    }
+```
+
+The `%:%` basically causes the nesting to be flattened, with n*m total tasks run in parallel.
+
+### Scenario 5B: Parallelizing across multiple nodes
+
+If you have access to multiple machines networked together, including a Linux cluster, you can use foreach across multiple nodes.
+
+The *doSNOW* backend has the advantage that it doesn't need to have MPI installed on the system. MPI can be tricky to install and keep working, so this is an easy approach to using *foreach* across multiple machines.
+
+Simply start R as you usually would. 
+
+Here's R code for using *doSNOW* as the back-end to *foreach*. Make sure to use the `type = "SOCK"` argument or *doSNOW* will actually use MPI behind the scenes. 
+
+```{r, doSNOW, eval=FALSE}
+```
+
+See also `doMPI.R` for how to use foreach with MPI, which is a bit more complicated.
+
+To use parallel variations on apply/sapply/lapply:
+
+```{r, sockets, eval=FALSE}
+```
+
+
+## 4.6) Scenario 6: Bootstrapping on a very large dataset
+
+**Scenario**: You are using bootstrapping on a very large dataset to compute a confidence interval or standard error.
+
+In many of R's parallelization tools, if you try to parallelize this case  on a single node, you end up making copies of the original dataset, which both takes up time and eats up memory. (Note that in this code, you also necessarily have a copy for each bootstrap sample dataset.)
+
+```{r, parallel-copy, eval=FALSE}
+```
+
+However, if you are working on a single machine (i.e., with shared memory) you can avoid this by using parallelization strategies that fork the original R process (i.e., make a copy of the process) and use the big data objects in the global environment (yes, this violates the usual programming best practices of not using global variables). So here we avoid copying the original dataset, though we do still have the copy for each bootstrap sample dataset.
+
+```{r, parallel-nocopy, eval=FALSE}
+```
+
+Parallelizing across nodes requires copying any big data across machines (one can't fork processes across nodes), which will be slow.
+
+## 4.7) Scenario 7: Simulation study with n=1000 replicates: parallel random number generation
+
+In the previous example, we set the random number seed to different values for each bootstrap sample. One danger in setting the seed like that is that the random numbers in the different bootstrap samples could overlap somewhat. This is probably somewhat unlikely if you are not generating a huge number of random numbers, but it's unclear how safe it is.
+
+The key thing when thinking about random numbers in a parallel context
+is that you want to avoid having the same 'random' numbers occur on
+multiple processes. On a computer, random numbers are not actually
+random but are generated as a sequence of pseudo-random numbers designed
+to mimic true random numbers. The sequence is finite (but very long)
+and eventually repeats itself. When one sets a seed, one is choosing
+a position in that sequence to start from. Subsequent random numbers
+are based on that subsequence. All random numbers can be generated
+from one or more random uniform numbers, so we can just think about
+a sequence of values between 0 and 1. 
+
+
+**Scenario**: You are running a simulation study with n=1000 replicates.
+
+Each replicate involves fitting 20 statistical/machine learning methods.
+
+Here, unless you really have access to multiple hundreds of cores, you might as well just parallelize across replicates.
+
+However, you need to think about random number generation.
+If you have overlap in the random numbers the replications may not be fully independent.
+
+In R, the  *rlecuyer* package deals with this.
+The L'Ecuyer algorithm has a period of $2^{191}$, which it divides
+into subsequences of length $2^{127}$. 
+
+Here's how you initialize independent sequences on different processes
+when using the *parallel* package's parallel apply functionality
+(illustrated here with *parSapply*).
+
+```{r, RNG-apply, eval=TRUE}
+```
+
+
+# 5) Other packages for parallelization in R
+
+## 5.1) The *future* package
+
+The *future* package and related packages (*future.apply*, *future.batchtools*) are an entire system for doing computations in parallel in an integrated system where you can write your code once and then deploy it in multiple different parallelization contexts by simply changing some initial code that controls how the parallelization is done. 
+
+# 5.2) The *partools* package
+
+*partools* is a new package developed by Norm Matloff at UC-Davis. He has the perspective that Spark/Hadoop are not the right tools in many cases when doing statistics-related work and has developed some simple tools for parallelizing computation across multiple nodes, also referred to as *Snowdoop*. The tools make use of the key idea in Hadoop of a distributed file system and distributed data objects but avoid the complications of trying to ensure fault tolerance, which is critical only on very large clusters of machines.
+
+## 5.3) pbdR
+
+pbdR is an effort to enhance R's capability for distributed
+memory processing called [pbdR](http://r-pbd.org). For an extensive tutorial, see the
+[pbdDEMO vignette](https://github.com/wrathematics/pbdDEMO/blob/master/inst/doc/pbdDEMO-guide.pdf?raw=true).
+ *pbdR* is designed for
+SPMD processing in batch mode, which means that you start up multiple
+processes in a non-interactive fashion using mpirun. The same code
+runs in each R process so you need to have the code behavior depend
+on the process ID.
+
+*pbdR* provides the following capabilities:
+ - the ability to do some parallel apply-style computations (this section),
+ - the ability to do distributed linear algebra by interfacing to *ScaLapack*, and
+ - an alternative to *Rmpi* for interfacing with MPI.
+
+Personally, I think the second of the three is the most exciting as
+it's a functionality not readily available in R or even more generally
+in other readily-accessible software.
